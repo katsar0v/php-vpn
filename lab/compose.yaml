@@ -1,0 +1,294 @@
+# php-vpn Docker test lab.  Drive it with lab/lab.sh (see lab/README.md).
+#
+#   internet 198.51.100.0/24 (internal)   wg-server .10  echo .30  hostdns .53
+#                                         php-cli .40  php-fpm .41  nginx .42  php-apache .43
+#                                         wg-client .60 (selftest only)
+#   vpnside  203.0.113.0/24  (internal)   wg-server .10  secret .20
+#   WireGuard tunnel 10.13.13.0/24        server 10.13.13.1:51820, clients 10.13.13.2+
+#
+# No host ports are published and both networks are `internal`.
+name: php-vpn-lab
+
+networks:
+  internet:
+    internal: true
+    ipam:
+      config:
+        - subnet: 198.51.100.0/24
+  vpnside:
+    internal: true
+    ipam:
+      config:
+        - subnet: 203.0.113.0/24
+
+x-lab-ids: &lab-ids
+  LAB_UID: ${LAB_UID:-1000}
+  LAB_GID: ${LAB_GID:-1000}
+
+x-php-env: &php-env
+  PHP_VPN_LAB: "1"
+  PHP_VPN_EXTRA_INI: ${PHP_VPN_EXTRA_INI:-}
+
+x-php-volumes: &php-volumes
+  - ..:/src:ro
+  - ../dist/php${PHP_VERSION:-8.4}:/opt/php-vpn:ro
+  - ./state/clients:/lab/clients:ro
+  - ./state/ca:/lab/ca:ro
+
+x-php-depends: &php-depends
+  init:
+    condition: service_completed_successfully
+  wg-server:
+    condition: service_healthy
+  hostdns:
+    condition: service_healthy
+  echo:
+    condition: service_healthy
+
+services:
+  # ---------------------------------------------------------------- one-shot init
+  init:
+    image: php-vpn-lab/tools:latest
+    pull_policy: never
+    command: ["/lab/gen-certs.sh"]
+    network_mode: none
+    environment: *lab-ids
+    volumes:
+      - ./state:/state
+    restart: "no"
+
+  # ---------------------------------------------------------------- WireGuard server + tunnel DNS
+  wg-server:
+    build:
+      context: .
+      dockerfile: tools/Dockerfile
+    image: php-vpn-lab/tools:latest
+    command: ["/lab/wg-server.sh"]
+    init: true
+    cap_add: [NET_ADMIN]
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    environment:
+      <<: *lab-ids
+      WG_FORCE_GO: ${WG_FORCE_GO:-0}
+    volumes:
+      - ./state:/state
+    networks:
+      internet:
+        ipv4_address: 198.51.100.10
+      vpnside:
+        ipv4_address: 203.0.113.10
+    healthcheck:
+      test: ["CMD-SHELL", "test -e /run/wg-ready && wg show wg0 >/dev/null"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+
+  # ---------------------------------------------------------------- "host" DNS (what PHP containers see)
+  hostdns:
+    image: php-vpn-lab/tools:latest
+    pull_policy: never
+    command: ["/lab/hostdns.sh"]
+    init: true
+    environment:
+      TZ: UTC
+    volumes:
+      - ./state:/state
+    networks:
+      internet:
+        ipv4_address: 198.51.100.53
+    healthcheck:
+      test: ["CMD-SHELL", "pidof dnsmasq >/dev/null"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    depends_on:
+      init:
+        condition: service_completed_successfully
+
+  # ---------------------------------------------------------------- fake internet
+  echo:
+    build:
+      context: .
+      dockerfile: echo/Dockerfile
+    image: php-vpn-lab/echo:latest
+    command: ["python", "/app/server.py", "--name", "echo", "--log", "/state/logs/echo.log",
+              "--http", "80",
+              "--https", "443:echo.lab.test",
+              "--https", "8443:wrong.lab.test",
+              "--https", "9443:echo.lab.test.selfsigned"]
+    init: true
+    volumes:
+      - ./state:/state
+    networks:
+      internet:
+        ipv4_address: 198.51.100.30
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1/healthz', timeout=3)"]
+      interval: 2s
+      timeout: 4s
+      retries: 30
+    depends_on:
+      init:
+        condition: service_completed_successfully
+
+  secret:
+    image: php-vpn-lab/echo:latest
+    pull_policy: never
+    command: ["python", "/app/server.py", "--name", "secret", "--log", "/state/logs/secret.log",
+              "--http", "80",
+              "--https", "443:secret.vpn.test"]
+    init: true
+    volumes:
+      - ./state:/state
+    networks:
+      vpnside:
+        ipv4_address: 203.0.113.20
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1/healthz', timeout=3)"]
+      interval: 2s
+      timeout: 4s
+      retries: 30
+    depends_on:
+      init:
+        condition: service_completed_successfully
+
+  # ---------------------------------------------------------------- PHP SAPIs
+  php-cli:
+    build:
+      context: .
+      dockerfile: php/Dockerfile
+      args:
+        PHP_VERSION: ${PHP_VERSION:-8.4}
+        SAPI: cli
+    image: php-vpn-lab/php-cli:${PHP_VERSION:-8.4}
+    command: ["sleep", "infinity"]
+    init: true
+    dns: [198.51.100.53]
+    environment:
+      <<: *php-env
+      LAB_SAPI: cli
+    volumes: *php-volumes
+    networks:
+      internet:
+        ipv4_address: 198.51.100.40
+    healthcheck:
+      test: ["CMD-SHELL", "test -e /run/lab-ready"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+    depends_on: *php-depends
+
+  php-fpm:
+    build:
+      context: .
+      dockerfile: php/Dockerfile
+      args:
+        PHP_VERSION: ${PHP_VERSION:-8.4}
+        SAPI: fpm
+    image: php-vpn-lab/php-fpm:${PHP_VERSION:-8.4}
+    command: ["php-fpm", "--nodaemonize"]
+    init: true
+    dns: [198.51.100.53]
+    environment:
+      <<: *php-env
+      LAB_SAPI: fpm
+    volumes: *php-volumes
+    networks:
+      internet:
+        ipv4_address: 198.51.100.41
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9001 && exec 4<>/dev/tcp/127.0.0.1/9002"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+    depends_on: *php-depends
+
+  nginx:
+    image: nginx:1.27-alpine
+    dns: [198.51.100.53]
+    volumes:
+      - ./nginx/lab.conf:/etc/nginx/conf.d/default.conf:ro
+      - ..:/src:ro
+    networks:
+      internet:
+        ipv4_address: 198.51.100.42
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    depends_on:
+      php-fpm:
+        condition: service_healthy
+      hostdns:
+        condition: service_healthy
+
+  php-apache:
+    build:
+      context: .
+      dockerfile: php/Dockerfile
+      args:
+        PHP_VERSION: ${PHP_VERSION:-8.4}
+        SAPI: apache
+    image: php-vpn-lab/php-apache:${PHP_VERSION:-8.4}
+    command: ["apache2-foreground"]
+    init: true
+    dns: [198.51.100.53]
+    environment:
+      <<: *php-env
+      LAB_SAPI: apache
+    volumes: *php-volumes
+    networks:
+      internet:
+        ipv4_address: 198.51.100.43
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://127.0.0.1/info.php"]
+      interval: 2s
+      timeout: 4s
+      retries: 60
+    depends_on: *php-depends
+
+  # ---------------------------------------------------------------- packet capture (idle until lab.sh capture start)
+  sniff:
+    image: php-vpn-lab/tools:latest
+    pull_policy: never
+    command: ["sleep", "infinity"]
+    init: true
+    network_mode: "service:php-cli"
+    cap_add: [NET_RAW, NET_ADMIN]
+    volumes:
+      - ./state:/state
+    depends_on:
+      php-cli:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------- selftest client (profile: selftest)
+  wg-client:
+    image: php-vpn-lab/tools:latest
+    pull_policy: never
+    profiles: [selftest]
+    command: ["/lab/wg-client.sh"]
+    init: true
+    cap_add: [NET_ADMIN]
+    dns: [198.51.100.53]
+    volumes:
+      - ./state/clients:/lab/clients:ro
+      - ./state/ca:/lab/ca:ro
+    networks:
+      internet:
+        ipv4_address: 198.51.100.60
+    healthcheck:
+      test: ["CMD-SHELL", "test -e /run/wg-ready"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    depends_on:
+      wg-server:
+        condition: service_healthy
+      echo:
+        condition: service_healthy
+      secret:
+        condition: service_healthy
+      hostdns:
+        condition: service_healthy

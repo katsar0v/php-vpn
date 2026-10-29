@@ -1,0 +1,6 @@
+# Optional override (selected by LAB_WG_GO=1 in lab.sh): force the wireguard-go
+# userspace implementation in wg-server instead of the kernel module.
+services:
+  wg-server:
+    devices:
+      - /dev/net/tun:/dev/net/tun

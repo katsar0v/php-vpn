@@ -1,0 +1,50 @@
+# cargo-deny configuration (https://embarkstudios.github.io/cargo-deny/).
+# Run with: ./dev deny            (or: cd core && cargo deny check)
+
+[graph]
+# Only the targets the release builds are made for.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+]
+
+[advisories]
+# RustSec advisory database; vulnerabilities, unsound crates and yanked
+# releases fail the check, unmaintained crates are reported for direct
+# dependencies of the workspace.
+version = 2
+yanked = "deny"
+unmaintained = "workspace"
+ignore = []
+
+[licenses]
+version = 2
+# Permissive licenses only. Anything outside this list needs a conscious
+# decision (add it here with a comment saying why), not an automatic pass.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "0BSD",
+    "Zlib",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0", # webpki-roots (Mozilla CA bundle)
+]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicate major versions are reported, not fatal.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true # the workspace crates depend on each other by path
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

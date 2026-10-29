@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = ["crates/vpn-core", "crates/vpn-ffi", "crates/vpn-poc"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.85"
+repository = "https://github.com/katsar0v/php-vpn"
+
+[workspace.dependencies]
+vpn-core = { path = "crates/vpn-core" }
+
+[profile.release]
+# Panics are caught at the FFI boundary and turned into PHP exceptions.
+panic = "unwind"
+lto = "thin"
+codegen-units = 4
+debug = "line-tables-only"

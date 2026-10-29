@@ -1,0 +1,738 @@
+#!/usr/bin/env bash
+# Development helper. Everything builds and runs in Docker.
+#
+#   ./dev core                 build the Rust core (libvpn_ffi.a) and vpn-poc
+#   ./dev cargo-test           Rust unit tests
+#   ./dev build [VER]          build php-vpn.so for PHP VER (default 8.4) -> dist/phpVER/
+#   ./dev test [VER]           run the .phpt suite (no network) for PHP VER
+#   ./dev build-all            build + test every supported PHP version
+#   ./dev arginfo              regenerate vpn_arginfo.h from vpn.stub.php
+#   ./dev poc ARGS...          run vpn-poc inside the lab's php-cli network namespace
+#   ./dev lab ARGS...          lab/lab.sh (up, down, selftest, ...)
+#   ./dev e2e [VER] [SAPI]     end-to-end tests against the lab (SAPI: cli|fpm|apache|all)
+#   ./dev dist [glibc|musl|all] [VER...]
+#                              portable release builds -> dist/release/php-vpn-<ver>-php<8.x>-nts-<arch>-<libc>.so
+#                              + SHA256SUMS (default: glibc 2.28 and musl, PHP 8.0-8.5 and the 8.6 RC)
+#   ./dev check-so FILE...     verify release .so files (exports, static TLS, libc baseline, loads on official images)
+#   ./dev test-so FILE...      run the .phpt suite against release .so files
+#   ./dev lint                 cargo fmt --check + cargo clippy -D warnings
+#   ./dev deny [ARGS...]       cargo-deny (licenses, advisories, bans, sources; core/deny.toml)
+#   (dist = ./dev dist-core LIBC + ./dev dist-ext LIBC VER per version; env: DIST_REBUILD=1 rebuilds the builder images)
+#
+# aarch64: `./dev dist` builds for the architecture of the Docker daemon, so run it on an arm64 host
+# (CI: the ubuntu-24.04-arm runner). On x86_64 it can be emulated: register QEMU once with
+# `docker run --privileged --rm tonistiigi/binfmt --install arm64`, then `DIST_PLATFORM=linux/arm64 ./dev dist`
+# (untested here, and very slow because the Rust core compiles under emulation).
+set -Eeuo pipefail
+
+readonly root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly rust_image="rust:1.96-slim-bullseye" # glibc 2.31 baseline
+readonly versions=(8.0 8.1 8.2 8.3 8.4 8.5)
+readonly uid="$(id -u)" gid="$(id -g)"
+
+die() {
+    printf 'dev: %s\n' "$*" >&2
+    exit 1
+}
+
+php_image() {
+    printf 'php:%s-cli' "$1"
+}
+
+cmd_core() {
+    docker run --rm \
+        -u "${uid}:${gid}" \
+        -e CARGO_HOME=/cargo \
+        -e RUSTUP_TOOLCHAIN=1.96.0 \
+        -e CARGO_TARGET_DIR=/src/core/target-docker \
+        -v php-vpn-cargo:/cargo \
+        -v "${root}:/src" \
+        -w /src/core \
+        "${rust_image}" \
+        sh -c 'cargo build --release --locked -p vpn-ffi -p vpn-poc'
+}
+
+ensure_cargo_volume() {
+    # The named volume starts root-owned; hand it to the calling user once.
+    docker run --rm -v php-vpn-cargo:/cargo "${rust_image}" \
+        sh -c "chown -R ${uid}:${gid} /cargo" >/dev/null
+}
+
+cmd_cargo_test() {
+    ensure_cargo_volume
+    docker run --rm \
+        -u "${uid}:${gid}" \
+        -e CARGO_HOME=/cargo \
+        -e RUSTUP_TOOLCHAIN=1.96.0 \
+        -e CARGO_TARGET_DIR=/src/core/target-docker \
+        -v php-vpn-cargo:/cargo \
+        -v "${root}:/src" \
+        -w /src/core \
+        "${rust_image}" \
+        sh -c 'cargo test --locked --workspace'
+}
+
+# Builds the extension against the PHP of the given version and copies it to
+# dist/php<ver>/php-vpn.so.
+cmd_build() {
+    local ver="${1:-8.4}"
+    ensure_cargo_volume
+    cmd_core
+    mkdir -p "${root}/dist/php${ver}"
+    docker run --rm \
+        -v "${root}:/src:ro" \
+        -v "${root}/dist/php${ver}:/out" \
+        "$(php_image "${ver}")" \
+        sh -euc '
+            apt_quiet() { apt-get "$@" >/dev/null 2>&1; }
+            if ! command -v phpize >/dev/null || ! command -v make >/dev/null || ! command -v gcc >/dev/null; then
+                apt_quiet update && apt_quiet install -y --no-install-recommends $PHPIZE_DEPS
+            fi
+            mkdir /build && cd /build
+            cp -r /src/config.m4 /src/php_vpn.c /src/php_vpn.h /src/vpn_arginfo.h /src/php-vpn.map /src/include /build/
+            phpize >/dev/null
+            ./configure --enable-vpn --with-vpn-core=/src/core/target-docker/release/libvpn_ffi.a >/dev/null
+            make -j"$(nproc)" 2>&1 | grep -E "warning|error" || true
+            test -f modules/vpn.so
+            strip --strip-debug -o /out/php-vpn.so modules/vpn.so
+            chown '"${uid}:${gid}"' /out/php-vpn.so
+            php -d extension=/out/php-vpn.so -r "echo \"PHP \", PHP_VERSION, \": vpn \", phpversion(\"vpn\"), \"\n\";"
+        '
+}
+
+cmd_test() {
+    local ver="${1:-8.4}"
+    [[ -f "${root}/dist/php${ver}/php-vpn.so" ]] || cmd_build "${ver}"
+    docker run --rm \
+        -v "${root}:/src:ro" \
+        -v "${root}/dist/php${ver}:/opt/php-vpn:ro" \
+        "$(php_image "${ver}")" \
+        sh -euc '
+            mkdir /t && cp -r /src/tests /t/ && cd /t
+            docker-php-source extract >/dev/null 2>&1 || true
+            runner=/usr/src/php/run-tests.php
+            [ -f "$runner" ] || runner=/usr/local/lib/php/build/run-tests.php
+            export TEST_PHP_EXECUTABLE=/usr/local/bin/php
+            php "$runner" -q --show-diff \
+                -d extension=/opt/php-vpn/php-vpn.so \
+                tests/'
+}
+
+cmd_build_all() {
+    local v
+    for v in "${versions[@]}"; do
+        printf '\n== PHP %s ==\n' "${v}"
+        cmd_build "${v}"
+        cmd_test "${v}"
+    done
+}
+
+cmd_arginfo() {
+    docker run --rm -v "${root}:/src" -w /src php:8.5-cli \
+        sh -c "docker-php-source extract >/dev/null && php /usr/src/php/build/gen_stub.php -f vpn.stub.php 2>&1 | grep -v '^PHP-Parser'; chown ${uid}:${gid} vpn_arginfo.h"
+}
+
+cmd_poc() {
+    [[ -x "${root}/core/target-docker/release/vpn-poc" ]] || cmd_core
+    "${root}/lab/lab.sh" exec php-cli /src/core/target-docker/release/vpn-poc "$@"
+}
+
+cmd_e2e() {
+    local ver="${1:-8.4}" sapi="${2:-all}"
+    [[ -f "${root}/dist/php${ver}/php-vpn.so" ]] || cmd_build "${ver}"
+    PHP_VERSION="${ver}" "${root}/tests/e2e/run.sh" "${sapi}"
+}
+
+# ---------------------------------------------------------------------------
+# Portable release builds (./dev dist), verification (check-so, test-so) and
+# the Rust quality gates (lint, deny).
+#
+# Builders are separate from the dev flow above (own images, own cargo volume,
+# own target dirs core/target-dist-*), so they never clash with `./dev core`.
+#
+#   glibc  AlmaLinux 8 (glibc 2.28): Rust core AND extension link there; PHP
+#          headers/phpize come from php.net source tarballs (docker/php-sources.txt)
+#          built once per version into the image php-vpn-dist-glibc228:php<VER>-<arch>.
+#   musl   Alpine: Rust core built in alpine (-crt-static off), extension linked
+#          inside the official php:<VER>-cli-alpine image.
+#   arch   the Docker daemon's (x86_64 or aarch64); DIST_PLATFORM=linux/arm64
+#          selects the other one on a daemon with QEMU/binfmt (very slow for Rust).
+# ---------------------------------------------------------------------------
+readonly self="${root}/$(basename "${BASH_SOURCE[0]}")"
+readonly dist_dir="${root}/dist/release"
+readonly dist_glibc_image="php-vpn-dist-glibc228"
+readonly dist_musl_image="php-vpn-dist-musl"
+readonly dist_cargo_volume="php-vpn-dist-cargo"
+readonly dist_versions=(8.0 8.1 8.2 8.3 8.4 8.5)
+readonly dist_preview_versions=(8.6) # release candidate: built best-effort
+readonly glibc_baseline="${GLIBC_BASELINE:-2.28}"
+readonly cargo_deny_version="0.20.2"
+
+plat=()
+if [[ -n ${DIST_PLATFORM:-} ]]; then
+    plat=(--platform "${DIST_PLATFORM}")
+fi
+
+ext_version() {
+    local v
+    v="$(sed -n 's/^#define PHP_VPN_VERSION "\(.*\)".*/\1/p' "${root}/php_vpn.h")"
+    [[ -n ${v} ]] || die "PHP_VPN_VERSION not found in php_vpn.h"
+    printf '%s\n' "${v}"
+}
+
+# x86_64 or aarch64: the architecture builds run (and the artifacts are for).
+dist_arch() {
+    local a
+    case "${DIST_PLATFORM:-}" in
+        linux/amd64) a=x86_64 ;;
+        linux/arm64) a=aarch64 ;;
+        '') a="$(docker info --format '{{.Architecture}}')" ;;
+        *) die "DIST_PLATFORM must be linux/amd64 or linux/arm64 (got ${DIST_PLATFORM})" ;;
+    esac
+    case "${a}" in
+        x86_64 | amd64) echo x86_64 ;;
+        aarch64 | arm64) echo aarch64 ;;
+        *) die "unsupported architecture: ${a}" ;;
+    esac
+}
+
+# php_pin VER -> "FULL-VERSION URL SHA256" from docker/php-sources.txt
+php_pin() {
+    local line
+    line="$(awk -v v="$1" '$1 == v {print $2, $3, $4}' "${root}/docker/php-sources.txt")"
+    [[ -n ${line} ]] || die "no PHP source pin for ${1} in docker/php-sources.txt"
+    printf '%s\n' "${line}"
+}
+
+is_preview() {
+    local pin
+    pin="$(php_pin "$1")"
+    [[ ${pin%% *} =~ (RC|alpha|beta) ]]
+}
+
+# official_image VER [-alpine]: the official php image of that series (release
+# candidates are published as php:<series>-rc-cli).
+official_image() {
+    if is_preview "$1"; then
+        printf 'php:%s-rc-cli%s\n' "$1" "${2:-}"
+    else
+        printf 'php:%s-cli%s\n' "$1" "${2:-}"
+    fi
+}
+
+# dist_image TAG DOCKERFILE TARGET [build args...]: build the builder image
+# unless it exists (DIST_REBUILD=1 rebuilds, with a fresh base image pull).
+dist_image() {
+    local tag="$1" dockerfile="$2" target="$3"
+    shift 3
+    local pull=()
+    if [[ ${DIST_REBUILD:-0} != 1 ]] && docker image inspect "${tag}" >/dev/null 2>&1; then
+        return 0
+    fi
+    [[ ${DIST_REBUILD:-0} != 1 ]] || pull=(--pull)
+    printf '== building builder image %s\n' "${tag}" >&2
+    docker build --progress=plain ${plat[@]+"${plat[@]}"} ${pull[@]+"${pull[@]}"} \
+        --target "${target}" -t "${tag}" -f "${root}/docker/${dockerfile}" \
+        "$@" "${root}/docker" >&2
+}
+
+# dist_core_setup LIBC: sets (in the caller's scope) arch, core_image,
+# core_target (dir below core/) and core_flags (extra RUSTFLAGS).
+dist_core_setup() {
+    arch="$(dist_arch)"
+    case "$1" in
+        glibc)
+            core_image="${dist_glibc_image}:base-${arch}"
+            core_target="target-dist-glibc228"
+            core_flags=""
+            ;;
+        musl)
+            core_image="${dist_musl_image}:rust-${arch}"
+            core_target="target-dist-musl"
+            core_flags="-C target-feature=-crt-static"
+            ;;
+        *) die "unknown libc '$1' (glibc|musl)" ;;
+    esac
+    [[ ${arch} == x86_64 ]] || core_target="${core_target}-${arch}"
+}
+
+dist_core_image() {
+    case "$1" in
+        glibc) dist_image "${core_image}" dist-glibc.Dockerfile base ;;
+        musl) dist_image "${core_image}" dist-musl.Dockerfile rust ;;
+    esac
+}
+
+# The named volume starts root-owned; hand it to the calling user once.
+ensure_dist_volume() {
+    docker run --rm ${plat[@]+"${plat[@]}"} -v "${dist_cargo_volume}:/cargo" "$1" \
+        sh -c "[ \"\$(stat -c %u /cargo)\" = ${uid} ] || chown -R ${uid}:${gid} /cargo"
+}
+
+# Phase 1: libvpn_ffi.a for one libc, into core/target-dist-<libc>.
+cmd_dist_core() {
+    local libc="${1:?usage: dist-core glibc|musl}" arch core_image core_target core_flags
+    local env=()
+    dist_core_setup "${libc}"
+    dist_core_image "${libc}"
+    ensure_dist_volume "${core_image}"
+    mkdir -p "${root}/core/${core_target}"
+    [[ -z ${core_flags} ]] || env=(-e "RUSTFLAGS=${core_flags}")
+    printf '== Rust core: %s %s -> core/%s\n' "${libc}" "${arch}" "${core_target}"
+    docker run --rm ${plat[@]+"${plat[@]}"} \
+        -u "${uid}:${gid}" \
+        -e CARGO_HOME=/cargo \
+        -e "CARGO_TARGET_DIR=/src/core/${core_target}" \
+        ${env[@]+"${env[@]}"} \
+        -v "${dist_cargo_volume}:/cargo" \
+        -v "${root}:/src:ro" \
+        -v "${root}/core/${core_target}:/src/core/${core_target}" \
+        -w /src/core \
+        "${core_image}" \
+        cargo build --release --locked -p vpn-ffi
+    [[ -f "${root}/core/${core_target}/release/libvpn_ffi.a" ]] ||
+        die "core/${core_target}/release/libvpn_ffi.a was not produced"
+}
+
+# Phase 2: link the extension for one libc + PHP series (needs phase 1).
+cmd_dist_ext() {
+    local libc="${1:?usage: dist-ext glibc|musl VER}" ver="${2:?usage: dist-ext glibc|musl VER}"
+    local arch core_image core_target core_flags image extver out full url sha configure_args=""
+    dist_core_setup "${libc}"
+    extver="$(ext_version)"
+    out="php-vpn-${extver}-php${ver}-nts-${arch}-${libc}.so"
+    case "${libc}" in
+        glibc)
+            read -r full url sha <<<"$(php_pin "${ver}")"
+            image="${dist_glibc_image}:php${ver}-${arch}"
+            dist_image "${image}" dist-glibc.Dockerfile php \
+                --build-arg "PHP_VERSION=${full}" --build-arg "PHP_URL=${url}" --build-arg "PHP_SHA256=${sha}"
+            ;;
+        musl)
+            image="${dist_musl_image}:link-php${ver}-${arch}"
+            # Some official alpine images (php:8.0-cli-alpine) ship no libgcc_s.so.1.
+            configure_args="--enable-vpn-static-libgcc"
+            dist_image "${image}" dist-musl.Dockerfile link \
+                --build-arg "PHP_IMAGE=$(official_image "${ver}" -alpine)"
+            ;;
+    esac
+    [[ -f "${root}/core/${core_target}/release/libvpn_ffi.a" ]] ||
+        die "core/${core_target}/release/libvpn_ffi.a is missing; run: ./dev dist-core ${libc}"
+    mkdir -p "${dist_dir}"
+    printf '== extension: %s\n' "${out}"
+    docker run --rm ${plat[@]+"${plat[@]}"} \
+        -u "${uid}:${gid}" \
+        -e "OUT=${out}" \
+        -e "CONFIGURE_ARGS=${configure_args}" \
+        -v "${root}:/src:ro" \
+        -v "${root}/core/${core_target}:/core:ro" \
+        -v "${dist_dir}:/out" \
+        "${image}" \
+        sh -euc '
+            b="$(mktemp -d)" && cd "$b"
+            cp -r /src/config.m4 /src/php_vpn.c /src/php_vpn.h /src/vpn_arginfo.h /src/php-vpn.map /src/include .
+            phpize >phpize.log 2>&1 || { cat phpize.log; exit 1; }
+            ./configure --enable-vpn $CONFIGURE_ARGS --with-vpn-core=/core/release/libvpn_ffi.a >configure.log 2>&1 ||
+                { tail -n 40 configure.log; exit 1; }
+            make -j"$(nproc)" >make.log 2>&1 || { cat make.log; exit 1; }
+            grep -E ": (warning|error)" make.log || true
+            test -f modules/vpn.so
+            strip --strip-unneeded -o "/out/$OUT" modules/vpn.so
+            php -d extension="/out/$OUT" -r "echo \"  loads: PHP \", PHP_VERSION, \", vpn \", phpversion(\"vpn\"), \"\n\";"
+        '
+}
+
+dist_sums() {
+    local tmp
+    (
+        cd "${dist_dir}"
+        compgen -G 'php-vpn-*.so' >/dev/null || exit 0
+        tmp="$(mktemp SHA256SUMS.XXXXXX)"
+        sha256sum php-vpn-*.so >"${tmp}"
+        chmod 0644 "${tmp}"
+        mv "${tmp}" SHA256SUMS
+    )
+}
+
+# ./dev dist [glibc|musl|all] [VER...]   (default: both libcs, 8.0-8.5 and the 8.6 RC)
+cmd_dist() {
+    local libcs=(glibc musl) vers explicit=0 libc v
+    case "${1:-}" in
+        glibc | musl)
+            libcs=("$1")
+            shift
+            ;;
+        all) shift ;;
+    esac
+    if [[ $# -gt 0 ]]; then
+        vers=("$@")
+        explicit=1
+    else
+        vers=("${dist_versions[@]}" "${dist_preview_versions[@]}")
+    fi
+    for v in "${vers[@]}"; do
+        php_pin "${v}" >/dev/null
+    done
+    mkdir -p "${dist_dir}"
+    for libc in "${libcs[@]}"; do
+        "${self}" dist-core "${libc}"
+        for v in "${vers[@]}"; do
+            # A child process, so a failure is not masked by the if/|| context.
+            if ! "${self}" dist-ext "${libc}" "${v}"; then
+                if [[ ${explicit} == 0 ]] && is_preview "${v}"; then
+                    printf 'dev: WARNING: PHP %s (release candidate) failed for %s; continuing\n' "${v}" "${libc}" >&2
+                else
+                    die "building ${libc} for PHP ${v} failed"
+                fi
+            fi
+        done
+    done
+    dist_sums
+    printf '\n'
+    ls -la "${dist_dir}"
+}
+
+# ---- verification of release builds ---------------------------------------
+
+# parse_so FILE: sets so_extver so_ver so_arch so_libc (name first, ELF/path as fallback).
+parse_so() {
+    local f="$1" base dir needed machine
+    base="$(basename "${f}")"
+    if [[ ${base} =~ ^php-vpn-(.+)-php([0-9]+\.[0-9]+)-nts-([a-z0-9_]+)-(glibc|musl)\.so$ ]]; then
+        so_extver="${BASH_REMATCH[1]}"
+        so_ver="${BASH_REMATCH[2]}"
+        so_arch="${BASH_REMATCH[3]}"
+        so_libc="${BASH_REMATCH[4]}"
+        return 0
+    fi
+    # Not a release name (e.g. dist/php8.4/php-vpn.so from ./dev build).
+    so_extver="$(ext_version)"
+    dir="$(basename "$(dirname "$(realpath "${f}")")")"
+    so_ver="${CHECK_PHP_VERSION:-}"
+    if [[ ${dir} =~ ^php([0-9]+\.[0-9]+)$ ]]; then
+        so_ver="${BASH_REMATCH[1]}"
+    fi
+    machine="$(readelf -h "${f}" | awk -F: '/Machine/ {print $2}')"
+    case "${machine}" in
+        *X86-64*) so_arch=x86_64 ;;
+        *AArch64*) so_arch=aarch64 ;;
+        *) so_arch=unknown ;;
+    esac
+    needed="$(readelf -d "${f}" | grep NEEDED || true)"
+    if grep -q 'libc.musl' <<<"${needed}"; then so_libc=musl; else so_libc=glibc; fi
+}
+
+require_binutils() {
+    local t
+    for t in nm readelf objdump; do
+        command -v "${t}" >/dev/null || die "${t} not found: install binutils"
+    done
+}
+
+check_failed=0
+c_ok() { printf '  ok    %-11s %s\n' "$1" "$2"; }
+c_skip() { printf '  skip  %-11s %s\n' "$1" "$2"; }
+c_fail() {
+    printf '  FAIL  %-11s %s\n' "$1" "$2"
+    check_failed=1
+}
+
+# ensure_image IMAGE: pull quietly if missing, so pull progress never ends up in captured output.
+ensure_image() {
+    docker image inspect "$1" >/dev/null 2>&1 || docker pull -q ${plat[@]+"${plat[@]}"} "$1" >/dev/null
+}
+
+# build_id_mismatch OUTPUT: PHP refused an NTS module because the image's PHP is
+# a ZTS build (the official php:8.6-rc-cli Debian image is). Not a defect of the .so.
+build_id_mismatch() {
+    grep -q 'compiled with build ID=API[0-9]*,NTS' <<<"$1" && grep -q 'compiled with build ID=API[0-9]*,TS' <<<"$1"
+}
+
+# check_load LABEL IMAGE FILE: the extension must load and report its version.
+check_load() {
+    local label="$1" image="$2" f="$3" out status=0
+    ensure_image "${image}" || {
+        c_fail load "${label}: cannot pull ${image}"
+        return 0
+    }
+    # PHP only warns when it cannot load a module, so the exit status alone proves nothing.
+    out="$(docker run --rm ${plat[@]+"${plat[@]}"} -v "$(dirname "$(realpath "${f}")"):/x:ro" "${image}" \
+        php -d "extension=/x/$(basename "${f}")" -r 'echo phpversion("vpn");' 2>&1)" || status=$?
+    if [[ ${status} == 0 && ${out} == "${so_extver}" ]]; then
+        c_ok load "${label}: vpn ${out}"
+    elif build_id_mismatch "${out}"; then
+        c_skip load "${label}: the image's PHP is a ZTS build, this is an NTS build"
+    elif [[ ${status} == 0 ]]; then
+        c_fail load "${label}: expected vpn ${so_extver}, got: ${out}"
+    else
+        c_fail load "${label}: ${out}"
+    fi
+}
+
+check_one_so() {
+    local f="$1" syms needed vers max bad="" lib allowed dyn rel stack
+    local so_extver so_ver so_arch so_libc
+    printf '%s\n' "${f}"
+    [[ -f ${f} ]] || {
+        c_fail file "not found"
+        return 0
+    }
+    parse_so "${f}"
+    printf '  (PHP %s, %s, %s, vpn %s)\n' "${so_ver:-?}" "${so_arch}" "${so_libc}" "${so_extver}"
+
+    # 1. only get_module is exported
+    syms="$(nm -D --defined-only "${f}" | awk 'NF >= 3 {print $3}' | sort -u | paste -sd' ' -)"
+    if [[ ${syms} == get_module ]]; then
+        c_ok exports "only get_module"
+    else
+        c_fail exports "exported symbols: ${syms:-none}"
+    fi
+
+    # 2. no static TLS (dlopen fails with "cannot allocate memory in static TLS block")
+    dyn="$(readelf -dW "${f}")"
+    rel="$(readelf -rW "${f}" | grep -E 'TPOFF|TPREL' || true)"
+    if grep -q STATIC_TLS <<<"${dyn}" || [[ -n ${rel} ]]; then
+        c_fail static-tls "STATIC_TLS flag or initial-exec TLS relocations present"
+    else
+        c_ok static-tls "no STATIC_TLS flag, no initial-exec TLS relocations"
+    fi
+
+    # 3. no executable stack, no text relocations
+    stack="$(readelf -lW "${f}" | awk '$1 == "GNU_STACK" {print $(NF-1)}')"
+    if [[ ${stack} == *E* ]]; then
+        c_fail hardening "executable stack (GNU_STACK ${stack})"
+    elif grep -q TEXTREL <<<"${dyn}"; then
+        c_fail hardening "text relocations (TEXTREL)"
+    else
+        c_ok hardening "non-executable stack, no TEXTREL"
+    fi
+
+    # 4. libc baseline
+    vers="$(objdump -T "${f}" | grep -o 'GLIBC_[0-9][0-9.]*' | sort -uV || true)"
+    max="$(tail -n1 <<<"${vers}")"
+    max="${max#GLIBC_}"
+    if [[ ${so_libc} == musl ]]; then
+        if [[ -n ${vers} ]]; then
+            c_fail libc "musl build references glibc symbols: $(paste -sd' ' - <<<"${vers}")"
+        else
+            c_ok libc "musl: no glibc symbol versions"
+        fi
+    elif [[ -z ${max} ]]; then
+        c_ok libc "no versioned glibc symbols"
+    elif [[ "$(printf '%s\n%s\n' "${max}" "${glibc_baseline}" | sort -V | tail -n1)" == "${glibc_baseline}" ]]; then
+        c_ok libc "max GLIBC_${max} <= baseline ${glibc_baseline}"
+    else
+        c_fail libc "requires GLIBC_${max}, baseline is ${glibc_baseline}"
+    fi
+
+    # 5. only expected shared-library dependencies
+    needed="$(readelf -dW "${f}" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p')"
+    if [[ ${so_libc} == musl ]]; then
+        allowed=' libc.musl-x86_64.so.1 libc.musl-aarch64.so.1 libgcc_s.so.1 '
+    else
+        allowed=' libc.so.6 libm.so.6 libdl.so.2 libpthread.so.0 librt.so.1 libutil.so.1 libgcc_s.so.1 ld-linux-x86-64.so.2 ld-linux-aarch64.so.1 '
+    fi
+    for lib in ${needed}; do
+        [[ ${allowed} == *" ${lib} "* ]] || bad="${bad} ${lib}"
+    done
+    if [[ -n ${bad} ]]; then
+        c_fail needed "unexpected dependencies:${bad}"
+    else
+        c_ok needed "$(paste -sd' ' - <<<"${needed}")"
+    fi
+
+    # 6. loads on the official images (and on the old distro the glibc build was linked on)
+    if [[ -z ${so_ver} ]]; then
+        c_fail load "PHP version unknown (use a release file name or CHECK_PHP_VERSION=8.x)"
+    elif [[ ${so_arch} != "$(dist_arch)" ]]; then
+        c_skip load "built for ${so_arch}, Docker runs $(dist_arch)"
+    elif [[ ${so_libc} == musl ]]; then
+        check_load "$(official_image "${so_ver}" -alpine)" "$(official_image "${so_ver}" -alpine)" "${f}"
+    else
+        check_load "$(official_image "${so_ver}")" "$(official_image "${so_ver}")" "${f}"
+        if docker image inspect "${dist_glibc_image}:php${so_ver}-${so_arch}" >/dev/null 2>&1; then
+            check_load "AlmaLinux 8, glibc 2.28 (${dist_glibc_image}:php${so_ver}-${so_arch})" \
+                "${dist_glibc_image}:php${so_ver}-${so_arch}" "${f}"
+        else
+            c_skip load "old-distro image ${dist_glibc_image}:php${so_ver}-${so_arch} not built"
+        fi
+    fi
+}
+
+cmd_check_so() {
+    [[ $# -gt 0 ]] || die "usage: ./dev check-so FILE..."
+    require_binutils
+    local f n=0 failed=0
+    for f in "$@"; do
+        check_failed=0
+        check_one_so "${f}"
+        n=$((n + 1))
+        failed=$((failed + check_failed))
+    done
+    printf '\ncheck-so: %d file(s), %d failed\n' "${n}" "${failed}"
+    [[ ${failed} == 0 ]]
+}
+
+# run_phpt IMAGE FILE: the .phpt suite against FILE inside IMAGE. Prints the
+# summary and PASS/FAIL; returns non-zero on failure. A suite in which nothing
+# passed (everything skipped because the extension did not load) fails too.
+run_phpt() {
+    local image="$1" f="$2" out
+    printf '== phpt: %s on %s\n' "$(basename "${f}")" "${image}"
+    if ! ensure_image "${image}"; then
+        printf 'FAIL  %s: cannot pull %s\n' "$(basename "${f}")" "${image}"
+        return 1
+    fi
+    if out="$(docker run --rm ${plat[@]+"${plat[@]}"} \
+        -v "${root}:/src:ro" \
+        -v "$(realpath "${f}"):/opt/php-vpn/php-vpn.so:ro" \
+        "${image}" \
+        sh -euc '
+            php -d extension=/opt/php-vpn/php-vpn.so -r "exit(extension_loaded(\"vpn\") ? 0 : 1);" ||
+                { echo "extension did not load"; exit 3; }
+            mkdir /t && cp -r /src/tests /t/ && cd /t
+            if command -v docker-php-source >/dev/null; then docker-php-source extract >/dev/null 2>&1 || true; fi
+            for runner in /usr/src/php/run-tests.php /usr/local/lib/php/build/run-tests.php /opt/php/lib/php/build/run-tests.php; do
+                [ -f "$runner" ] && break
+            done
+            export TEST_PHP_EXECUTABLE="$(command -v php)"
+            php "$runner" -q --show-diff -d extension=/opt/php-vpn/php-vpn.so tests/' 2>&1)"; then
+        if grep -Eq '^Tests passed +: +[1-9]' <<<"${out}"; then
+            grep -E '^(Number of tests|Tests (skipped|warned|failed|passed)|Expected fail)' <<<"${out}"
+            printf 'PASS  %s\n' "$(basename "${f}")"
+            return 0
+        fi
+        printf '%s\n' "${out}"
+        printf 'FAIL  %s: no test passed\n' "$(basename "${f}")"
+        return 1
+    fi
+    if build_id_mismatch "${out}"; then
+        printf 'skip  %s: the image'"'"'s PHP is a ZTS build, this is an NTS build\n' "$(basename "${f}")"
+        return 0
+    fi
+    printf '%s\n' "${out}"
+    printf 'FAIL  %s\n' "$(basename "${f}")"
+    return 1
+}
+
+# ./dev test-so FILE...: the .phpt suite against release builds, on the official
+# image of the matching PHP version and libc (glibc builds also on the AlmaLinux 8
+# image they were linked on, when it exists).
+cmd_test_so() {
+    [[ $# -gt 0 ]] || die "usage: ./dev test-so FILE..."
+    require_binutils
+    local f image images n=0 failed=0 so_extver so_ver so_arch so_libc
+    for f in "$@"; do
+        n=$((n + 1))
+        if [[ ! -f ${f} ]]; then
+            printf 'FAIL  %s: not found\n' "${f}"
+            failed=$((failed + 1))
+            continue
+        fi
+        parse_so "${f}"
+        if [[ -z ${so_ver} ]]; then
+            printf 'FAIL  %s: PHP version unknown (CHECK_PHP_VERSION=8.x)\n' "${f}"
+            failed=$((failed + 1))
+            continue
+        fi
+        if [[ ${so_arch} != "$(dist_arch)" ]]; then
+            printf 'skip  %s: built for %s, Docker runs %s\n' "${f}" "${so_arch}" "$(dist_arch)"
+            continue
+        fi
+        if [[ ${so_libc} == musl ]]; then
+            images=("$(official_image "${so_ver}" -alpine)")
+        else
+            images=("$(official_image "${so_ver}")")
+            if docker image inspect "${dist_glibc_image}:php${so_ver}-${so_arch}" >/dev/null 2>&1; then
+                images+=("${dist_glibc_image}:php${so_ver}-${so_arch}")
+            fi
+        fi
+        for image in "${images[@]}"; do
+            run_phpt "${image}" "${f}" || failed=$((failed + 1))
+        done
+    done
+    printf '\ntest-so: %d file(s), %d failed\n' "${n}" "${failed}"
+    [[ ${failed} == 0 ]]
+}
+
+# ---- Rust quality gates -----------------------------------------------------
+
+# Runs in the glibc 2.28 builder image (Rust 1.96.0 + clippy + rustfmt), with its
+# own target dir, so it does not touch core/target-docker.
+dist_rust_run() {
+    local arch core_image core_target core_flags
+    dist_core_setup glibc
+    dist_core_image glibc
+    ensure_dist_volume "${core_image}"
+    mkdir -p "${root}/core/${core_target}"
+    docker run --rm ${plat[@]+"${plat[@]}"} \
+        -u "${uid}:${gid}" \
+        -e CARGO_HOME=/cargo \
+        -e "CARGO_TARGET_DIR=/src/core/${core_target}" \
+        -v "${dist_cargo_volume}:/cargo" \
+        -v "${root}:/src:ro" \
+        -v "${root}/core/${core_target}:/src/core/${core_target}" \
+        -w /src/core \
+        "${core_image}" \
+        "$@"
+}
+
+cmd_lint() {
+    dist_rust_run sh -c '
+        rc=0
+        echo "== cargo fmt --all --check"
+        cargo fmt --all -- --check || rc=1
+        echo "== cargo clippy --workspace --all-targets -- -D warnings"
+        cargo clippy --locked --workspace --all-targets -- -D warnings || rc=1
+        exit $rc'
+}
+
+# ./dev deny [cargo-deny args]: licenses, advisories, bans, sources (core/deny.toml).
+# cargo-deny is the published static (musl) release binary, verified against its
+# .sha256 and cached in the cargo volume.
+cmd_deny() {
+    local args=("$@")
+    [[ ${#args[@]} -gt 0 ]] || args=(check)
+    dist_rust_run env "CARGO_DENY_VERSION=${cargo_deny_version}" sh -euc '
+        v="$CARGO_DENY_VERSION"
+        bin="/cargo/bin/cargo-deny-$v"
+        if [ ! -x "$bin" ]; then
+            asset="cargo-deny-$v-$(uname -m)-unknown-linux-musl"
+            url="https://github.com/EmbarkStudios/cargo-deny/releases/download/$v/$asset.tar.gz"
+            d="$(mktemp -d)"
+            curl -fsSL -o "$d/a.tar.gz" "$url"
+            curl -fsSL "$url.sha256" | awk "{print \$1 \"  a.tar.gz\"}" | (cd "$d" && sha256sum -c -)
+            tar -xzf "$d/a.tar.gz" -C "$d" --strip-components=1
+            mkdir -p /cargo/bin
+            install -m 0755 "$d/cargo-deny" "$bin"
+            rm -rf "$d"
+        fi
+        cd /src/core
+        exec "$bin" --locked "$@"' sh "${args[@]}"
+}
+
+main() {
+    local cmd="${1:-}"
+    shift || true
+    case "${cmd}" in
+        core) cmd_core ;;
+        cargo-test) cmd_cargo_test ;;
+        build) cmd_build "$@" ;;
+        test) cmd_test "$@" ;;
+        build-all) cmd_build_all ;;
+        arginfo) cmd_arginfo ;;
+        poc) cmd_poc "$@" ;;
+        lab) exec "${root}/lab/lab.sh" "$@" ;;
+        e2e) cmd_e2e "$@" ;;
+        dist) cmd_dist "$@" ;;
+        dist-core) cmd_dist_core "$@" ;;
+        dist-ext) cmd_dist_ext "$@" ;;
+        check-so) cmd_check_so "$@" ;;
+        test-so) cmd_test_so "$@" ;;
+        lint) cmd_lint ;;
+        deny) cmd_deny "$@" ;;
+        *) awk 'NR > 1 && /^#/ {sub(/^# ?/, ""); print; next} NR > 1 {exit}' "${BASH_SOURCE[0]}"; [[ -z "${cmd}" ]] || exit 1 ;;
+    esac
+}
+
+main "$@"

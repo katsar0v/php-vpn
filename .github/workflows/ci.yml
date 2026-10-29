@@ -1,0 +1,198 @@
+name: CI
+
+# Everything builds through ./dev (Docker), so a CI job and a developer run the
+# same commands. Run any job's commands locally with the ./dev subcommand named
+# in its steps.
+#
+#   rust       fmt + clippy + unit tests      (./dev lint, ./dev cargo-test; native toolchain here for speed)
+#   deny       cargo-deny                     (./dev deny)
+#   phpt       build + .phpt suite, PHP 8.0-8.5   (./dev build / ./dev test)
+#   e2e        lab end-to-end, PHP 8.4        (./dev e2e 8.4 all)
+#   release    portable .so matrix on tags    (./dev dist, ./dev check-so, ./dev test-so)
+#   bundle     one SHA256SUMS over every release .so
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (fmt, clippy, test)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: core
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the toolchain pinned in core/rust-toolchain.toml
+        run: |
+          channel="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "${channel}" --profile minimal --component clippy --component rustfmt --no-self-update
+          rustup default "${channel}"
+          rustc --version
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            core/target
+          key: rust-${{ runner.os }}-${{ hashFiles('core/Cargo.lock', 'core/rust-toolchain.toml') }}
+          restore-keys: rust-${{ runner.os }}-
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: cargo test
+        run: cargo test --locked --workspace
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: core/Cargo.toml
+          command: check
+          # core/deny.toml is picked up from the workspace root.
+
+  phpt:
+    name: build + phpt (PHP ${{ matrix.php }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ["8.0", "8.1", "8.2", "8.3", "8.4", "8.5"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/cache@v6
+        with:
+          path: core/target-docker
+          key: core-docker-${{ runner.arch }}-${{ hashFiles('core/Cargo.lock', 'core/rust-toolchain.toml') }}
+          restore-keys: core-docker-${{ runner.arch }}-
+      - name: Build php-vpn.so for PHP ${{ matrix.php }}
+        run: ./dev build "${{ matrix.php }}"
+      - name: Run the phpt suite
+        run: ./dev test "${{ matrix.php }}"
+
+  e2e:
+    name: lab end-to-end (PHP 8.4)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/cache@v6
+        with:
+          path: core/target-docker
+          key: core-docker-${{ runner.arch }}-${{ hashFiles('core/Cargo.lock', 'core/rust-toolchain.toml') }}
+          restore-keys: core-docker-${{ runner.arch }}-
+      - name: Tools used by tests/e2e/run.sh
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bc
+      - name: WireGuard backend for the lab (kernel module, else wireguard-go)
+        run: |
+          if sudo modprobe wireguard; then
+            echo "kernel WireGuard module available"
+          else
+            echo "no kernel WireGuard module: the lab falls back to wireguard-go (LAB_WG_GO=1)"
+            echo "LAB_WG_GO=1" >> "${GITHUB_ENV}"
+            sudo modprobe tun || true
+            ls -l /dev/net/tun
+          fi
+      - name: Build php-vpn.so (PHP 8.4)
+        run: ./dev build 8.4
+      - name: End-to-end tests
+        run: ./dev e2e 8.4 all
+      - name: Lab logs and captures
+        if: failure()
+        run: ./dev lab logs > lab/state/compose.log 2>&1 || true
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: e2e-lab-state
+          path: |
+            lab/state/compose.log
+            lab/state/logs
+            lab/state/pcap
+          if-no-files-found: ignore
+      - name: Stop the lab
+        if: always()
+        run: ./dev lab down || true
+
+  release:
+    name: release ${{ matrix.leg.arch }}-${{ matrix.leg.libc }} PHP ${{ matrix.php }}
+    # Release candidates (tags) and manual runs only.
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    needs: [rust, deny, phpt]
+    runs-on: ${{ matrix.leg.runner }}
+    # aarch64 is built natively on arm64 runners (no QEMU), it has not been run by
+    # the maintainers yet, and the 8.6 release candidate is best-effort: neither
+    # may fail the workflow.
+    continue-on-error: ${{ matrix.leg.experimental || matrix.php == '8.6' }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        leg:
+          - { arch: x86_64, libc: glibc, runner: ubuntu-24.04 }
+          - { arch: x86_64, libc: musl, runner: ubuntu-24.04 }
+          # Free for public repositories only; drop these legs otherwise.
+          - { arch: aarch64, libc: glibc, runner: ubuntu-24.04-arm, experimental: true }
+          - { arch: aarch64, libc: musl, runner: ubuntu-24.04-arm, experimental: true }
+        php: ["8.0", "8.1", "8.2", "8.3", "8.4", "8.5", "8.6"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/cache@v6
+        with:
+          path: core/target-dist-*
+          key: dist-${{ matrix.leg.arch }}-${{ matrix.leg.libc }}-${{ hashFiles('core/Cargo.lock', 'core/rust-toolchain.toml') }}
+          restore-keys: dist-${{ matrix.leg.arch }}-${{ matrix.leg.libc }}-
+      - name: Build (glibc 2.28 builder on AlmaLinux 8 / Alpine for musl)
+        run: ./dev dist "${{ matrix.leg.libc }}" "${{ matrix.php }}"
+      - name: Verify the shared object
+        run: ./dev check-so dist/release/php-vpn-*.so
+      - name: Run the phpt suite against the release build
+        run: ./dev test-so dist/release/php-vpn-*.so
+      - uses: actions/upload-artifact@v7
+        with:
+          name: php-vpn-${{ matrix.leg.arch }}-${{ matrix.leg.libc }}-php${{ matrix.php }}
+          path: dist/release/php-vpn-*.so
+          if-no-files-found: error
+
+  bundle:
+    name: release bundle (SHA256SUMS)
+    needs: release
+    if: ${{ !cancelled() && needs.release.result != 'skipped' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: php-vpn-*
+          path: dist/release
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist/release
+        run: |
+          sha256sum php-vpn-*.so > SHA256SUMS
+          ls -la
+          cat SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: php-vpn-release
+          path: dist/release/*
+          if-no-files-found: error

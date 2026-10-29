@@ -1,0 +1,15 @@
+[package]
+name = "vpn-ffi"
+description = "C ABI over vpn-core, linked into the php-vpn extension"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+vpn-core.workspace = true
+libc = "0.2"

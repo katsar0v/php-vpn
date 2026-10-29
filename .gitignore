@@ -1,0 +1,47 @@
+# Rust
+/core/target/
+# phpize / configure output
+/.libs/
+/modules/
+/autom4te.cache/
+/build/
+/include/php_vpn_core.h.tmp
+*.lo
+*.la
+*.o
+*.dep
+/Makefile
+/Makefile.fragments
+/Makefile.global
+/Makefile.objects
+/acinclude.m4
+/aclocal.m4
+/config.guess
+/config.h
+/config.h.in
+/config.h.in~
+/config.log
+/config.nice
+/config.status
+/config.sub
+/configure
+/configure.ac
+/configure~
+/install-sh
+/libtool
+/ltmain.sh
+/missing
+/mkinstalldirs
+/run-tests.php
+/tests/*.diff
+/tests/*.exp
+/tests/*.log
+/tests/*.out
+/tests/*.php
+/tests/*.sh
+/tests/*.mem
+# Build artifacts and lab state
+/dist/
+/lab/state/
+/core/target-docker/
+/core/target-dist-*/

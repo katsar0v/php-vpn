@@ -1,0 +1,7 @@
+/* Only the PHP module entry point is exported; the Rust core stays private. */
+{
+	global:
+		get_module;
+	local:
+		*;
+};

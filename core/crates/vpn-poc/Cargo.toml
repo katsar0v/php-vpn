@@ -1,0 +1,11 @@
+[package]
+name = "vpn-poc"
+description = "Standalone proof of concept: one HTTP(S) request through a WireGuard profile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+vpn-core.workspace = true
